@@ -27,7 +27,9 @@ const trackProgress = (id, branch, repository, sha, user) => {
     rulesDeleted: 0,
     error: null,
     logs,
-    log
+    log,
+    updatedConnections : [],
+    deletedRules : []
   };
 };
 
@@ -54,7 +56,8 @@ export default (storageContext, id, branch, repository, sha, user) => {
         .then(() => auth0.updateDatabases(progress, context.client, context.databases))
         .then(() => auth0.deleteRules(progress, context.client, context.rules))
         .then(() => auth0.updateRules(progress, context.client, context.rules))
-        .then(() => progress.log('Done.'));
+        .then(() => progress.log('Done.'))
+        .catch((err) => auth0.rollbackProgress(progress,context.client,err))
     })
     .then(() => appendProgress(storageContext, progress))
     .then(() => pushToSlack(progress, `${config('WT_URL')}/login`))

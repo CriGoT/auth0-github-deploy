@@ -37,7 +37,12 @@ const updateDatabase = (progress, client, connections, database) => {
 
   progress.connectionsUpdated++;
   progress.log(`Updating database ${connection.id}: ${JSON.stringify(options, null, 2)}`);
-  return client.connections.update({ id: connection.id }, { options });
+  return client.connections.update({ id: connection.id }, { options })
+    .then(connectionUpdated => {
+      progress.log(`Database ${connection.id} succesfully updated`);
+      progress.updatedConnections.push(connection);
+      return connectionUpdated;
+    });
 };
 
 /*
@@ -50,10 +55,40 @@ export const updateDatabases = (progress, client, databases) => {
 
   return getDatabaseConnections(client, databases)
     .then(connections =>
-      Promise.map(databases,
-        (database) => updateDatabase(progress, client, connections, database),
-        { concurrency: constants.CONCURRENT_CALLS })
-    );
+      Promise
+        .map(databases,
+          (database) => updateDatabase(progress, client, connections, database),
+          { concurrency: constants.CONCURRENT_CALLS })
+        );
+};
+
+
+/*
+ * Rollbacks a database to its initial state.
+ */
+const rollbackDatabase = (progress, client, connection) => {
+  progress.log(`Rolling back connection '${connection.name}'`);
+  const options = connection.options || { };
+
+  progress.log(`Resetting database ${connection.id}: ${JSON.stringify(options, null, 2)}`);
+  return client.connections.update({ id: connection.id }, { options })
+    .then(updatedConnection => {
+      progress.log(`Database ${connection.id} rolled back`);
+      return updatedConnection;
+    });
+};
+
+
+/* 
+ * Rolbacks all changes made to databases
+ */
+const rollbackDatabases = (progress, client) => {
+  if (!progress.updatedConnections || progress.updatedConnections.length === 0) {
+    return Promise.resolve(true);
+  }
+
+  return Promise.map(progress.updatedConnections,
+    (connection) => rollbackDatabase(progress, client, connection));
 };
 
 /*
@@ -73,11 +108,15 @@ const deleteRule = (progress, client, rules, existingRule) => {
   const rule = _.find(rules, { name: existingRule.name });
   if (!rule) {
     progress.rulesDeleted++;
-    progress.log(`Deleting rule ${existingRule.name} (${existingRule.id})`);
-    return client.rules.delete({ id: existingRule.id });
   }
-
-  return null;
+  
+  progress.log(`Deleting rule ${existingRule.name} (${existingRule.id})`);
+  return client.rules.delete({ id: existingRule.id })
+    .then(() => {
+      progress.log(`Rule ${existingRule.name} succesfully deleted`);
+      progress.deletedRules.push(existingRule);
+      return;
+    });
 };
 
 /*
@@ -88,7 +127,7 @@ export const deleteRules = (progress, client, rules) => {
     return Promise.resolve(true);
   }
 
-  progress.log('Deleting rules that no longer exist in the repository...');
+  progress.log('Deleting all rules to replace them with the ones existing in the repository...');
 
   return getRules(client)
     .then(existingRules => {
@@ -104,33 +143,25 @@ const updateRule = (progress, client, existingRules, ruleName, ruleData) => {
   progress.log(`Processing rule '${ruleName}'`);
 
   const rule = _.find(existingRules, { name: ruleName });
-  if (!rule) {
-    const payload = {
-      enabled: true,
-      stage: 'login_success',
-      ...ruleData.metadata,
-      name: ruleName,
-      script: ruleData.script
-    };
-
-    progress.rulesCreated++;
-    progress.log(`Creating rule ${ruleName}: ${JSON.stringify(payload, null, 2)}`);
-
-    return client.rules.create(payload);
-  }
-
   const payload = {
+    enabled: true,
+    stage: 'login_success',
     ...ruleData.metadata,
-    script: ruleData.script || rule.script
+    name: ruleName,
+    script: ruleData.script
   };
 
-  // Remove properties that are not allowed during update.
-  delete payload.stage;
-
-  // Update the rule.
-  progress.rulesUpdated++;
-  progress.log(`Updating rule ${ruleName} (${rule.id}): ${JSON.stringify(payload, null, 2)}`);
-  return client.rules.update({ id: rule.id }, payload);
+  if (!rule) {
+    // New rule
+    progress.rulesCreated++;
+    progress.log(`Creating rule ${ruleName}: ${JSON.stringify(payload, null, 2)}`);
+  } else {
+    // Rule already existed.
+    progress.rulesUpdated++;
+    progress.log(`Updating rule ${ruleName}: ${JSON.stringify(payload, null, 2)}`);
+  }
+  
+  return client.rules.create(payload);
 };
 
 /*
@@ -143,9 +174,60 @@ export const updateRules = (progress, client, rules) => {
 
   progress.log('Updating rules...');
 
+  return Promise.map(rules, 
+    (rule) => updateRule(progress, client, progress.deletedRules, rule.name, rule),
+    { concurrency: constants.CONCURRENT_CALLS });
+};
+
+/*
+ * Restores a rule deleted during deployment
+ */
+const rollbackRule = (progress, client, rule) => {
+  progress.log(`Rolling back rule '${rule.name}'`);
+  delete rule.id;
+
+  return client.rules.create(rule);
+}
+
+/*
+ * Rollback all changes applied to rules in the tenant
+ */
+const rollbackRules = (progress, client) => {
+  progress.log('Attempting to rollback changes in rules');
+
   return getRules(client)
     .then(existingRules => {
-      progress.log(`Existing rules: ${JSON.stringify(existingRules.map(rule => ({ id: rule.id, name: rule.name, stage: rule.stage, order: rule.order })), null, 2)}`);
-      return Promise.map(rules, (rule) => updateRule(progress, client, existingRules, rule.name, rule), { concurrency: constants.CONCURRENT_CALLS });
-    });
+      if (existingRules.length === 0 ) {
+        return Promise.resolve();
+      }
+
+      progress.log(`Removing all ${existingRules.length} deployed rules`);
+      return Promise.map(existingRules, 
+        (rule) => client.rules.delete({ id: rule.id }),
+        { concurrency: constants.CONCURRENT_CALLS });
+      })
+      .then(() => Promise.map(progress.deletedRules,
+        (rule) => rollbackRule(progress, client, rule),
+        { concurrency: constants.CONCURRENT_CALLS }
+      ));
 };
+
+export const rollbackProgress = (progress, client, err) => {
+  if (err) progress.log(`An error ocurred: ${err.message}`);
+
+  progress.log('Trying to rollback changes made during the deployment');
+
+  return rollbackDatabases(progress, client)
+    .then(()=> rollbackRules(progress, client))
+    .then(
+      () => {
+        progress.log('Rollback completed succesfully');
+        delete progress.updatedConnections;
+        delete progress.deletedRules;
+        if (err) throw err;
+      }, 
+      (errRollback)=> {
+        progress.log(`Rollback could not be completed. ${errRollback}`);
+        if (err) throw err;
+      });
+}
